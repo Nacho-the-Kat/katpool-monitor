@@ -1,70 +1,146 @@
 import express from 'express';
 import fs from 'fs';
 import path from 'path';
-import { getBalances, getTotals, getPaymentsByWallet, getPayments, getBlockDetails, getBalanceByWallet, getKASPayoutForLast48H, getNachoPaymentsGroupedByWallet, getTotalKASPayoutForLast24H, getBlockCount } from './db'; // Import the new function
-import { getCurrentPoolHashRate } from './prom';
-import *  as constants from './constants';
+import {
+  getBalances,
+  getTotals,
+  getPaymentsByWallet,
+  getPayments,
+  getBlockDetails,
+  getBalanceByWallet,
+  getKASPayoutForLast48H,
+  getNachoPaymentsGroupedByWallet,
+  getTotalKASPayoutForLast24H,
+  getBlockCount,
+} from './db';
+import { getCurrentPoolHashRate } from './utils';
+import * as constants from './constants';
+import { apiLimiter } from './utils';
+import { errorHandler, asyncHandler } from './middleware/errorHandler';
+import { DatabaseError, NotFoundError, ConfigError } from './errors/customErrors';
+import logger from './logger';
+import rTracer from 'cls-rtracer';
+import { requestContextMiddleware } from './middleware/requestContext';
 
 const app = express();
 const port = 9301;
 
-// Existing API endpoints
-app.get('/balance', async (req, res) => {
-  const balances = await getBalances('balance');
-  res.json({ balance: balances });
+// Apply request context middleware first
+app.use(rTracer.expressMiddleware());
+// This middleware check header x-request-id from frontend and rewrite requestId in rTracer
+app.use(requestContextMiddleware);
+
+// Apply rate limiting to all routes
+app.use(apiLimiter);
+
+// Add basic middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// Add request logging middleware
+app.use((req, res, next) => {
+  logger.info(`${req.method} ${req.url}`);
+  next();
 });
+
+// Add response logging middleware
+app.use((req, res, next) => {
+  const start = Date.now();
+  const originalSend = res.send;
+  let responseBody: unknown;
+
+  res.send = function (body: unknown) {
+    responseBody = body;
+    return originalSend.call(this, body);
+  };
+
+  const requestId = String(rTracer.id());
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    logger.info(`${req.method} ${req.url} ${res.statusCode} - ${duration}ms`, {
+      ms: duration,
+      statusCode: res.statusCode,
+      response: responseBody,
+      requestId,
+    });
+  });
+  next();
+});
+
+// Existing API endpoints
+app.get(
+  '/balance',
+  asyncHandler(async (req, res) => {
+    const balances = await getBalances('balance');
+    if (!balances) {
+      throw new DatabaseError('Failed to retrieve balances');
+    }
+    res.json({ balance: balances });
+  })
+);
 
 // New API endpoint to retrieve balances by wallet_address
-app.get('/balance/:wallet_address', async (req, res) => {
-  const walletAddress = req.params.wallet_address;
-  try {
-    const balances = await getBalanceByWallet(walletAddress, 'miners_balance'); // Use the function from db.ts
+app.get(
+  '/balance/:wallet_address',
+  asyncHandler(async (req, res) => {
+    const walletAddress = req.params.wallet_address;
+    const balances = await getBalanceByWallet(walletAddress, 'miners_balance');
+    if (!balances) {
+      throw new NotFoundError(`No balance found for wallet: ${walletAddress}`);
+    }
     res.json({ balance: balances });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving payments');
-  }
-});
+  })
+);
 
-app.get('/total', async (req, res) => {
-  const totals = await getTotals();
-  res.json({ total: totals });
-});
+app.get(
+  '/total',
+  asyncHandler(async (req, res) => {
+    const totals = await getTotals();
+    if (!totals) {
+      throw new DatabaseError('Failed to retrieve totals');
+    }
+    res.json({ total: totals });
+  })
+);
 
-app.get('/config', (req, res) => {
-  const configPath = path.resolve('./config/received_config.json');
-  if (fs.existsSync(configPath)) {
+app.get(
+  '/config',
+  asyncHandler(async (req, res) => {
+    const configPath = path.resolve('./config/received_config.json');
+    if (!fs.existsSync(configPath)) {
+      throw new ConfigError('Config file not found');
+    }
     const configData = fs.readFileSync(configPath, 'utf-8');
     res.status(200).json(JSON.parse(configData));
-  } else {
-    res.status(404).send('Config file not found.');
-  }
-});
+  })
+);
 
-app.get('/api/miningPoolStats', async (req, res) => {
-  try {
+app.get(
+  '/api/miningPoolStats',
+  asyncHandler(async (req, res) => {
     const configPath = path.resolve('./config/received_config.json');
-    let poolFee, url, advertise_image, minPay, blocks, lastBlockDetails, lastblock, lastblocktime;
+    let poolFee, url, minPay, lastblock, lastblocktime;
+
     if (fs.existsSync(configPath)) {
       const configData = fs.readFileSync(configPath, 'utf-8');
-      const configJson = JSON.parse(configData)
+      const configJson = JSON.parse(configData);
       poolFee = configJson?.treasury?.fee;
       url = configJson?.hostname;
-      advertise_image = configJson?.advertise_image_link;
-      minPay = configJson?.thresholdAmount! / constants.KAStoSompi;
+      minPay = configJson?.thresholdAmount
+        ? configJson.thresholdAmount / constants.KAStoSompi
+        : undefined;
     }
 
     const current_hashRate = await getCurrentPoolHashRate();
-    blocks = await getBlockDetails();
-    [lastBlockDetails] = await getBlockDetails(1, 1);
+    const blocks = await getBlockDetails();
+    const [lastBlockDetails] = await getBlockDetails(1, 1);
 
     if (lastBlockDetails) {
-      lastblock = lastBlockDetails.mined_block_hash
-      lastblocktime = lastBlockDetails.timestamp
+      lastblock = lastBlockDetails.mined_block_hash;
+      lastblocktime = lastBlockDetails.timestamp;
     }
     url = url || constants.pool_url;
     poolFee = poolFee || constants.pool_fee;
-    advertise_image = advertise_image || constants.advertise_image_link; 
 
     const poolLevelData = {
       coin_mined: constants.coin_mined,
@@ -78,75 +154,80 @@ app.get('/api/miningPoolStats', async (req, res) => {
       country: constants.country,
       feeType: constants.feeType,
       lastblock,
-      lastblocktime
-    }
-    res.status(200).send(poolLevelData)
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving mining pool stats')
-  }
-})
+      lastblocktime,
+    };
+    res.status(200).send(poolLevelData);
+  })
+);
 
-app.get('/api/pool/payouts', async (req, res) => {
-  try {
+app.get(
+  '/api/pool/payouts',
+  asyncHandler(async (req, res) => {
     const payments = await getPayments('payments');
-    res.status(200).json(payments)
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving payments')
-  }
-})
+    if (!payments) {
+      throw new DatabaseError('Failed to retrieve payments');
+    }
+    res.status(200).json(payments);
+  })
+);
 
-app.get('/api/pool/48hKASpayouts', async (req, res) => {
-  try {
+app.get(
+  '/api/pool/48hKASpayouts',
+  asyncHandler(async (req, res) => {
     const payments = await getKASPayoutForLast48H();
-    res.status(200).json(payments)
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving 48H KAS payments for Top miners')
-  }
-})
-
-// New API endpoint to retrieve payments by wallet_address
-app.get('/api/payments/:wallet_address', async (req, res) => {
-  const walletAddress = req.params.wallet_address;
-  try {
-    const payments = await getPaymentsByWallet(walletAddress, 'payments'); // Use the function from db.ts
+    if (!payments) {
+      throw new DatabaseError('Failed to retrieve 48H KAS payments');
+    }
     res.status(200).json(payments);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving payments');
-  }
-});
+  })
+);
 
-app.get('/api/pool/nacho_payouts', async (req, res) => {
-  try {
+app.get(
+  '/api/payments/:wallet_address',
+  asyncHandler(async (req, res) => {
+    const walletAddress = req.params.wallet_address;
+    const payments = await getPaymentsByWallet(walletAddress, 'payments');
+    if (!payments) {
+      throw new NotFoundError(`No payments found for wallet: ${walletAddress}`);
+    }
+    res.status(200).json(payments);
+  })
+);
+
+app.get(
+  '/api/pool/nacho_payouts',
+  asyncHandler(async (req, res) => {
     const payments = await getPayments('nacho_payments');
-    res.status(200).json(payments)
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving payments')
-  }
-})
-
-// New API endpoint to retrieve payments by wallet_address
-app.get('/api/nacho_payments/:wallet_address', async (req, res) => {
-  const walletAddress = req.params.wallet_address;
-  try {
-    const payments = await getPaymentsByWallet(walletAddress, 'nacho_payments'); // Use the function from db.ts
+    if (!payments) {
+      throw new DatabaseError('Failed to retrieve nacho payments');
+    }
     res.status(200).json(payments);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving payments');
-  }
-});
+  })
+);
 
-app.get('/api/blockdetails', async (req, res) => {
-  try {
+app.get(
+  '/api/nacho_payments/:wallet_address',
+  asyncHandler(async (req, res) => {
+    const walletAddress = req.params.wallet_address;
+    const payments = await getPaymentsByWallet(walletAddress, 'nacho_payments');
+    if (!payments) {
+      throw new NotFoundError(`No nacho payments found for wallet: ${walletAddress}`);
+    }
+    res.status(200).json(payments);
+  })
+);
+
+// TODO: need to change nginx config for this route
+app.get(
+  '/api/pool/blockdetails',
+  asyncHandler(async (req, res) => {
     const currentPage = req.query.currentPage ? parseInt(req.query.currentPage as string) : 1;
     const perPage = req.query.perPage ? parseInt(req.query.perPage as string) : 100;
 
     const blockdetails = await getBlockDetails(currentPage, perPage);
+    if (!blockdetails) {
+      throw new DatabaseError('Failed to retrieve block details');
+    }
 
     const totalCount = await getBlockCount();
     res.status(200).json({
@@ -158,40 +239,57 @@ app.get('/api/blockdetails', async (req, res) => {
         totalPages: totalCount ? Math.ceil(totalCount / perPage) : undefined,
       },
     });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving blockdetails');
-  }
-});
+  })
+);
 
-
-app.get('/api/pool/48hNACHOPayouts', async (req, res) => {
-  try {
+app.get(
+  '/api/pool/48hNACHOPayouts',
+  asyncHandler(async (req, res) => {
     const nacho_payments = await getNachoPaymentsGroupedByWallet();
-    const formatted = nacho_payments.reduce((acc: { [key: string]: number }, item: { wallet_address: string, total_nacho_payment_amount: string }) => {
-      acc[item.wallet_address] = Number(item.total_nacho_payment_amount);
+    if (!nacho_payments) {
+      throw new DatabaseError('Failed to retrieve 48h NACHO payouts');
+    }
+    const formatted = nacho_payments.reduce<{ [key: string]: number }>((acc, item) => {
+      acc[item.wallet_address] = item.total_nacho_payment_amount;
       return acc;
     }, {});
     res.status(200).json(formatted);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving 48hNACHOPayouts');
-  }
-});
+  })
+);
 
-app.get('/api/pool/24hTotalKASPayouts', async (req, res) => {
-  try {
+app.get(
+  '/api/pool/24hTotalKASPayouts',
+  asyncHandler(async (req, res) => {
     const payments = await getTotalKASPayoutForLast24H();
-    res.status(200).json(payments)
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Error retrieving getTotalKASPayoutForLast24H')
-  }
-})
+    if (!payments) {
+      throw new DatabaseError('Failed to retrieve 24h total KAS payouts');
+    }
+    res.status(200).json(payments);
+  })
+);
+
+// Add error handling middleware at the end of all routes
+app.use(errorHandler);
 
 // Start the server
 export function startServer() {
-  app.listen(port, () => {
-    console.log(`API Server running at http://localhost:${port}`);
+  const server = app.listen(port, () => {
+    logger.info(`API Server running at http://localhost:${port}`);
   });
+
+  // Handle unhandled promise rejections
+  process.on('unhandledRejection', (err: Error) => {
+    logger.error('Unhandled Promise Rejection:', err);
+    // Close server & exit process
+    server.close(() => process.exit(1));
+  });
+
+  // Handle uncaught exceptions
+  process.on('uncaughtException', (err: Error) => {
+    logger.error('Uncaught Exception:', err);
+    // Close server & exit process
+    server.close(() => process.exit(1));
+  });
+
+  return server;
 }
